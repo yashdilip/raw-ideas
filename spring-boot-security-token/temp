@@ -1,0 +1,315 @@
+import zipfile
+import os
+
+# Update the project structure
+project_structure = {
+    "spring-boot-security-token/src/main/java/com/example/security": [
+        "TokenController.java",
+        "TokenService.java",
+        "TokenFilter.java",
+        "WebSecurityConfig.java",
+        "CustomAuthenticationSuccessHandler.java",
+        "CustomAuthenticationFailureHandler.java"
+    ],
+    "spring-boot-security-token/src/main/resources/templates": [
+        "login.jsp",
+        "enterToken.jsp",
+        "landing.jsp"
+    ],
+    "spring-boot-security-token/src/main/resources": [
+        "application.properties"
+    ]
+}
+
+# Content for each file
+file_contents = {
+    "TokenController.java": """import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+
+@Controller
+public class TokenController {
+
+    @Autowired
+    private TokenService tokenService;
+
+    @GetMapping("/generate-token")
+    public String generateToken(Model model) {
+        // Get the authenticated user's details
+        UserDetails userDetails = (UserDetails) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        String username = userDetails.getUsername();
+
+        // Generate the token and store it in the database
+        String token = tokenService.generateToken(username);
+        model.addAttribute("token", token);
+
+        return "enterToken";
+    }
+
+    @PostMapping("/validate-token")
+    public String validateToken(@RequestParam String token, Model model) {
+        if (tokenService.validateToken(token)) {
+            // Set the security context as confirmed
+            Authentication authentication = tokenService.getAuthentication(token);
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
+            return "redirect:/landing";
+        } else {
+            model.addAttribute("error", "Invalid token");
+            return "enterToken";
+        }
+    }
+
+    @GetMapping("/landing")
+    public String landing() {
+        return "landing";
+    }
+}
+""",
+    "TokenService.java": """import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.stereotype.Service;
+
+import java.security.SecureRandom;
+import java.util.HashMap;
+import java.util.Map;
+
+@Service
+public class TokenService {
+
+    @Autowired
+    private UserDetailsService userDetailsService;
+
+    private final Map<String, String> tokenStore = new HashMap<>();
+    private final SecureRandom secureRandom = new SecureRandom();
+
+    public String generateToken(String username) {
+        String token = String.format("%08d", secureRandom.nextInt(100000000));
+        tokenStore.put(token, username);
+        return token;
+    }
+
+    public boolean validateToken(String token) {
+        return tokenStore.containsKey(token);
+    }
+
+    public Authentication getAuthentication(String token) {
+        String username = tokenStore.get(token);
+        UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+        return new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+    }
+}
+""",
+    "TokenFilter.java": """import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+@Component
+public class TokenFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private TokenService tokenService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+
+        Authentication currentAuthentication = SecurityContextHolder.getContext().getAuthentication();
+
+        if (currentAuthentication == null || !currentAuthentication.isAuthenticated()) {
+            String token = request.getParameter("token");
+
+            if (token != null && tokenService.validateToken(token)) {
+                Authentication authentication = tokenService.getAuthentication(token);
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+
+        chain.doFilter(request, response);
+    }
+}
+""",
+    "WebSecurityConfig.java": """import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configuration.WebSecurityConfigurerAdapter;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
+
+    @Autowired
+    private CustomAuthenticationSuccessHandler successHandler;
+
+    @Autowired
+    private CustomAuthenticationFailureHandler failureHandler;
+
+    @Autowired
+    private UserDetailsService customUserDetailsService;
+
+    @Autowired
+    private TokenFilter tokenFilter;
+
+    @Override
+    protected void configure(AuthenticationManagerBuilder auth) throws Exception {
+        auth.userDetailsService(customUserDetailsService)
+            .passwordEncoder(passwordEncoder());
+    }
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .authorizeRequests()
+            .antMatchers("/login", "/authenticate", "/validate-token", "/generate-token").permitAll()
+            .anyRequest().authenticated()
+            .and()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .formLogin().loginPage("/login")
+            .successHandler(successHandler)
+            .failureHandler(failureHandler);
+
+        http.addFilterBefore(tokenFilter, UsernamePasswordAuthenticationFilter.class);
+    }
+
+    @Override
+    @Bean
+    public AuthenticationManager authenticationManagerBean() throws Exception {
+        return super.authenticationManagerBean();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+""",
+    "CustomAuthenticationSuccessHandler.java": """import org.springframework.security.core.Authentication;
+import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
+import org.springframework.stereotype.Component;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+@Component
+public class CustomAuthenticationSuccessHandler implements AuthenticationSuccessHandler {
+    @Override
+    public void onAuthenticationSuccess(HttpServletRequest request, HttpServletResponse response, Authentication authentication) throws IOException {
+        response.sendRedirect("/generate-token");
+    }
+}
+""",
+    "CustomAuthenticationFailureHandler.java": """import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.authentication.AuthenticationFailureHandler;
+import org.springframework.stereotype.Component;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+@Component
+public class CustomAuthenticationFailureHandler implements AuthenticationFailureHandler {
+    @Override
+    public void onAuthenticationFailure(HttpServletRequest request, HttpServletResponse response, AuthenticationException exception) throws IOException {
+        response.sendRedirect("/login?error=true");
+    }
+}
+""",
+    "login.jsp": """<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+</head>
+<body>
+    <h2>Login</h2>
+    <form action="/login" method="post">
+        <label>Username:</label>
+        <input type="text" name="username"/><br/>
+        <label>Password:</label>
+        <input type="password" name="password"/><br/>
+        <input type="submit" value="Login"/>
+        <c:if test="${not empty param.error}">
+            <div style="color: red">Invalid username or password.</div>
+        </c:if>
+    </form>
+</body>
+</html>
+""",
+    "enterToken.jsp": """<!DOCTYPE html>
+<html>
+<head>
+    <title>Enter Token</title>
+</head>
+<body>
+    <h2>Enter Token</h2>
+    <form action="/validate-token" method="post">
+        <label>Token:</label>
+        <input type="text" name="token"/><br/>
+        <input type="submit" value="Submit"/>
+        <c:if test="${not empty error}">
+            <div style="color: red">${error}</div>
+        </c:if>
+    </form>
+</body>
+</html>
+""",
+    "landing.jsp": """<!DOCTYPE html>
+<html>
+<head>
+    <title>Landing Page</title>
+</head>
+<body>
+    <h2>Welcome to the Landing Page!</h2>
+</body>
+</html>
+""",
+    "application.properties": """# Application properties
+server.port=8080
+spring.mvc.view.prefix=/WEB-INF/views/
+spring.mvc.view.suffix=.jsp
+"""
+}
+
+# Create the project directory structure and files
+base_dir = "/mnt/data/spring-boot-security-token"
+
+for dir_path, files in project_structure.items():
+    full_dir_path = os.path.join(base_dir, dir_path)
+    os.makedirs(full_dir_path, exist_ok=True)
+    for file_name in files:
+        file_path = os.path.join(full_dir_path, file_name)
+        with open(file_path, "w") as file:
+            file.write(file_contents.get(file_name, ""))
+
+# Zip the project directory
+zip_file_path = "/mnt/data/spring-boot-security-token.zip"
+with zipfile.ZipFile(zip_file_path, 'w') as zip_file:
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+
